@@ -1,0 +1,534 @@
+#Libraries
+import numpy as np 
+import matplotlib.pyplot as plt
+from sklearn.linear_model import Ridge
+from multiprocessing import Pool
+from multiprocessing import set_start_method
+import h5py
+import math 
+import random
+import pickle 
+import itertools as it
+
+
+
+
+# Hyperparameters  
+input_dim_X= 64
+input_dim_Y= 64
+time_lengh= 3477
+States= 2
+input_dim_total= input_dim_X*input_dim_Y*States
+#Possible groupsizes are 1, 2, 4, 8, 16, 32, 64 as number of groups need to be devidable by input dim X and input dim Y
+groupsize= 4
+group_interaction= 1
+past_states= 2
+number_of_groups= int((input_dim_X*input_dim_Y)/(groupsize*groupsize))
+pred_lengh_iterativ= 60
+#Maximum number of used trajectories is 15 for this data set
+used_trajectories= 15
+scaling_on= False
+on_groupnumbers = 2
+number_of_runs= 1
+maximum_noise_level= 800
+minimum_noise_level= 0.5
+maximum_ridge_param= 0.1
+minimum_ridge_param= 0.000001
+performance_eval= 'kinetik'
+p_monomials= 2
+horizontal_plot= 0
+
+with h5py.File('Data_set_Kolmogorov/Kolmogorov_All_Trajectories.h5', 'r') as f:
+    p = f['Kolmogorov']
+    input_sequence_global = np.array(p)
+    del p 
+    del f
+
+train_input_sequence_global= input_sequence_global[0:used_trajectories,:,:,:,:]
+test_input_sequence_global= input_sequence_global[15,:,:,:,:]
+del input_sequence_global
+
+
+def scale (data,std,mean):
+    mean = np.repeat(mean[np.newaxis,:,:,:,:], np.shape(data)[0], axis=0)
+    std = np.repeat(std[np.newaxis,:,:,:,:], np.shape(data)[0], axis=0)
+    data = np.array((data - mean)/std)
+    return data
+
+
+def descale (data,std,mean):
+    data = np.array(data*std + mean)
+    return data
+
+
+def addNoise(data, percent):
+    std_data = np.std(data, axis=(0,2))
+    #Reshape the std_data by adding a dimension to the 0 and 2 axis
+    std_data = std_data[np.newaxis,:,np.newaxis,:,:]
+    std_data = np.repeat(std_data, np.shape(data)[2], axis=2)
+    std_data = np.repeat(std_data, np.shape(data)[0], axis=0)
+    noise = np.multiply(np.random.randn(*np.shape(data)), percent/1000.0*std_data)
+    data += noise
+    return data
+
+
+def callculate_wout (ridge_param): 
+
+    global train_input_sequence_big
+
+    #Crate the Elements of the feature Vector and Traget Vector for the training
+    #Reduce train_input_sequence_big back into the shape of trajectories
+
+    for r in range (on_groupnumbers):
+        for q in range (used_trajectories):
+            print (r)
+            f= groupsize+(group_interaction*2)
+            lorenz_soln= np.zeros((States,time_lengh,f,f))
+            #Creat the input sequence for the training 
+            
+            if r == 0:
+                    groupnumber=0
+            elif r == 1:
+                    groupnumber=int(number_of_groups/5)
+            elif r == 2:
+                groupnumber=int(number_of_groups*2/5)
+            elif r == 3:
+                groupnumber=int(number_of_groups*3/5)
+            elif r == 4:
+                groupnumber=int(number_of_groups*4/5)
+
+
+
+            #Y_Position 
+            Y_position = (groupnumber*groupsize%int(input_dim_Y))
+            #X_Position
+            X_position = int(groupnumber*groupsize/int(input_dim_Y))*groupsize
+            #Creat the input sequence for the training
+            lorenz_soln[:,:,:,:]= train_input_sequence_big[q,:,:,X_position:X_position+groupsize+group_interaction*2,Y_position:Y_position+groupsize+group_interaction*2]
+
+
+            
+            train_lengh= time_lengh
+            d=f*f*States
+            dlin = past_states*d
+
+            if p_monomials == 2:
+                dnonlin= int(dlin*(dlin+1)/2)
+
+            elif p_monomials == 3:
+                dnonlin_1 = int(dlin*(dlin+1)/2)
+                dnonlin = dnonlin_1 + int(math.factorial(dlin+3-1)/(math.factorial(3)*math.factorial(dlin-1)))
+
+            dtot = 1 + dlin + dnonlin
+
+            # create an array to hold the linear part of the feature vector
+            x = np.zeros((dlin,train_lengh))
+
+            #Reshape Lorenz_soln into the right dimensinos for the feature vector
+            lorenz_soln_reshape_1=np.reshape(lorenz_soln,(States,train_lengh,f*f))
+            lorenz_soln_reshap=lorenz_soln_reshape_1.transpose(0,2,1).reshape(States*f*f,train_lengh)
+
+
+            # fill in the linear part of the feature vector for all times
+            for delay in range(past_states):
+                for j in range(delay,train_lengh):
+                    x[d*delay:d*(delay+1),j]=lorenz_soln_reshap[:,j-delay]
+
+            # create an array to hold the full feature vector for training time
+            # (use ones so the constant term is already 1)
+            out_train = np.ones((dtot,train_lengh-past_states+1))
+
+            # copy over the linear part (shift over by one to account for constant)
+            out_train[1:dlin+1,:]=x[:,past_states-1:train_lengh]
+
+            #Alternative Implementation of the above loop
+            combination_result_11= list(it.combinations_with_replacement(x[:,past_states-1:train_lengh],2))
+            combination_result_21= np.prod(combination_result_11, axis=1)
+            out_train[dlin+1:dlin+1+int(dlin*(dlin+1)/2),:]= combination_result_21
+
+            # Fill in the second non-linear part if p_monomials == 3
+            if p_monomials == 3:
+                combinations_matrix= x[:,past_states-1:train_lengh]
+                combination_result_1= list(it.combinations_with_replacement(combinations_matrix,3))
+                combination_result_2= np.prod(combination_result_1, axis=1)
+                out_train[1+dlin+int(dlin*(dlin+1)/2):,]= combination_result_2
+
+                
+            # Ridge Regression: Train W_out with maping the out_train to the group values without the group interaction dimensions 
+            # Find the target data of the Regression, Modelling 
+            H= out_train[:,0:-1]
+
+            #Alternativ implementation of the above loop
+            x_new_1 = lorenz_soln[:,:,group_interaction:group_interaction+groupsize,group_interaction:group_interaction+groupsize]
+            x_new_1= x_new_1.reshape(States,train_lengh,groupsize*groupsize)
+            x_new= x_new_1.transpose(0,2,1).reshape(States*groupsize*groupsize,train_lengh)
+
+
+
+            Y= (x_new[:,past_states:train_lengh]-x_new[:,past_states-1:train_lengh-1])
+            H= H.transpose()
+            Y= Y.transpose()
+            #Store the H and Y in a big matrix, add results together on the zero axis 
+            if r == 0 and q == 0:
+                H_big= H
+                Y_big= Y
+            else:
+                H_big= np.concatenate((H_big,H),axis=0)
+                Y_big= np.concatenate((Y_big,Y),axis=0)
+
+
+    print("starting_training")
+    del H
+    del Y
+    del train_input_sequence_big
+    del lorenz_soln
+    del lorenz_soln_reshap
+    del lorenz_soln_reshape_1
+    del x
+    del x_new
+    del out_train
+    # ridge regression: train W_out to map out_train to Lorenz[t] - Lorenz[t - 1]
+    ridge = Ridge(alpha=ridge_param, fit_intercept=False, copy_X=True, solver='auto')
+    ridge.fit(H_big, Y_big)
+    W_out = ridge.coef_
+    print ("W_out_predicted")
+    return W_out
+
+
+def prediction_1Iter_1Group(groupnumber,test):
+
+    f= groupsize+(group_interaction*2)
+    #Y_Position 
+    Y_position = (groupnumber*groupsize%int(input_dim_Y))
+    #X_Position
+    X_position = int(groupnumber*groupsize/int(input_dim_X))*groupsize
+
+    lorenz_soln= np.zeros((States,past_states,f,f))
+
+    lorenz_soln[:,:,:,:]= train_input_sequence_big_2[:,:,X_position:X_position+groupsize+group_interaction*2,Y_position:Y_position+groupsize+group_interaction*2]
+    
+    d=f*f*States
+    dlin = past_states*d
+    if p_monomials == 2:
+        dnonlin= int(dlin*(dlin+1)/2)
+
+    elif p_monomials == 3:
+        dnonlin_1 = int(dlin*(dlin+1)/2)
+        dnonlin = dnonlin_1 + int(math.factorial(dlin+3-1)/(math.factorial(3)*math.factorial(dlin-1)))
+
+    dtot = 1 + dlin + dnonlin
+    W_out= W_out_list
+
+
+    #Reshape Lorenz_soln Alternative Implementierung 
+    lorenz_soln_reshape_1=np.reshape(lorenz_soln,(States,past_states,f*f))
+    lorenz_soln_reshap= lorenz_soln_reshape_1.transpose(0,2,1).reshape(States*f*f,past_states)
+
+
+    pred_1Iter_1Group=np.zeros(groupsize*groupsize)
+
+
+    #Create Linear Feature Vector, to hold the startpoint of the callculation so that at the top there are the values for the parameters 
+    # at the 1000 Point and at the Bottom at the 999 Point 
+    # create an array to hold the linear part of the feature vector
+    x = np.zeros((dlin,past_states))
+    # fill in the linear part of the feature vector for all times
+    for delay in range(past_states):
+        for j in range(delay,past_states):
+            x[d*delay:d*(delay+1),j]=lorenz_soln_reshap[:,j-delay]
+
+
+    # create a place to store feature vector for prediction
+    out_test = np.ones(dtot)              # full feature vector
+    x_test = np.zeros(dlin)                # linear part
+
+    # copy over initial linear feature vector
+    x_test[:] = x[:,past_states-1]
+
+    # do prediction
+    # copy linear part into whole feature vector
+    out_test[1:dlin+1]=x_test[:] # shift by one for constant
+    # fill in the non-linear part
+    #Alternative Implementation of the above loop
+    combination_result_11= list(it.combinations_with_replacement(x_test[:],2))
+    combination_result_21= np.prod(combination_result_11, axis=1)
+    out_test[dlin+1:dlin+1+int(dlin*(dlin+1)/2)]= combination_result_21
+
+    # Fill in the second non-linear part if p_monomials == 3
+    if p_monomials == 3:
+        combinations_matrix= x_test[:]
+        combination_result_1= list(it.combinations_with_replacement(combinations_matrix,3))
+        combination_result_2= np.prod(combination_result_1, axis=1)
+        out_test[1+dlin+int(dlin*(dlin+1)/2):,]= combination_result_2
+
+
+
+    x_initial_1= lorenz_soln[:,past_states-1,group_interaction:group_interaction+groupsize,group_interaction:group_interaction+groupsize].reshape(States,1,groupsize*groupsize)
+    x_initial= x_initial_1.transpose(0,2,1).reshape(States*groupsize*groupsize, 1).transpose()
+
+    # do a prediction
+    pred_1Iter_1Group= x_initial + W_out @ out_test[:]
+        
+    return pred_1Iter_1Group
+
+
+def prediction_1Iteration(): 
+
+
+    #Develop original shape of the system states with 4 dimensions from the last_pred vector alternative version 
+    last_pred_reshape_1= np.reshape(last_pred,(States,input_dim_X*input_dim_Y,past_states)).transpose(0,2,1)
+    last_pred_reshape= np.reshape(last_pred_reshape_1,(States,past_states,input_dim_X,input_dim_Y))
+
+
+    global train_input_sequence_big_2
+
+    #Create a big matrix with multiple train_input_sequences added together 
+    train_input_sequence_big_2= np.zeros((2,past_states,input_dim_X+group_interaction*2,input_dim_Y+group_interaction*2))
+    #Fill up train input sequence big with the train input sequence
+    train_input_sequence_big_2[:,:,group_interaction:group_interaction+input_dim_X,group_interaction:group_interaction+input_dim_Y]= last_pred_reshape[:,0:past_states,:,:]
+    train_input_sequence_big_2[:,:,0:group_interaction,group_interaction:input_dim_Y+group_interaction]= last_pred_reshape[:,0:past_states,input_dim_X-group_interaction:input_dim_X,:]
+    train_input_sequence_big_2[:,:,input_dim_X+group_interaction:input_dim_X+group_interaction*2,group_interaction:input_dim_Y+group_interaction]= last_pred_reshape[:,0:past_states,0:group_interaction,:]
+    train_input_sequence_big_2[:,:,group_interaction:group_interaction+input_dim_X,0:group_interaction]= last_pred_reshape[:,0:past_states,:,input_dim_Y-group_interaction:input_dim_Y]
+    train_input_sequence_big_2[:,:,0:group_interaction,0:group_interaction]= last_pred_reshape[:,0:past_states,input_dim_X-group_interaction:input_dim_X,input_dim_Y-group_interaction:input_dim_Y]
+    train_input_sequence_big_2[:,:,input_dim_X+group_interaction:input_dim_X+group_interaction*2,0:group_interaction]= last_pred_reshape[:,0:past_states,0:group_interaction,input_dim_Y-group_interaction:input_dim_Y]
+    train_input_sequence_big_2[:,:,group_interaction:group_interaction+input_dim_X,input_dim_Y+group_interaction:input_dim_Y+group_interaction*2]= last_pred_reshape[:,0:past_states,:,0:group_interaction]
+    train_input_sequence_big_2[:,:,0:group_interaction,input_dim_Y+group_interaction:input_dim_Y+group_interaction*2]= last_pred_reshape[:,0:past_states,input_dim_X-group_interaction:input_dim_X,0:group_interaction]
+    train_input_sequence_big_2[:,:,input_dim_X+group_interaction:input_dim_X+group_interaction*2,input_dim_Y+group_interaction:input_dim_Y+group_interaction*2]= last_pred_reshape[:,0:past_states,0:group_interaction,0:group_interaction]
+
+    #Define an Array to hold the prediction for one iteration step
+    prediction_1Iter= np.zeros(input_dim_total)
+    pred_1Iter_1Group= np.zeros(States*groupsize*groupsize)
+
+    with Pool() as pool:
+        args = [(i,1) for i in range(number_of_groups)]
+        result= pool.starmap(prediction_1Iter_1Group, args)
+    
+
+
+    for i in range (number_of_groups): 
+        for j in range (States):
+            pred_1Iter_1Group[:]= result[i]
+            prediction_1Iter[(j*input_dim_X*input_dim_Y)+i*groupsize*groupsize:(j*input_dim_X*input_dim_Y)+i*groupsize*groupsize+(groupsize*groupsize)]= pred_1Iter_1Group[j*groupsize*groupsize:(j+1)*groupsize*groupsize]
+
+    print("predicted one step")
+    return prediction_1Iter
+
+
+def optimization():
+    global train_input_sequence_global
+    global W_out_list
+    global train_input_sequence_big
+    #Finde noise_level and ridge_param for the optimization
+    #noise_level= round(random.uniform(minimum_noise_level,maximum_noise_level),4)
+    #ridge_param= round(random.uniform(minimum_ridge_param,maximum_ridge_param),4)
+    
+    noise_level= 200
+    ridge_param= 0.0090088
+
+    train_input_sequence_global= addNoise(train_input_sequence_global, noise_level)
+    test_input_sequence= test_input_sequence_global
+    mean_train_noise_global = (np.mean(train_input_sequence_global, axis=(0,2)))[:,np.newaxis,:,:]
+    std_train_noise_global = (np.std(train_input_sequence_global, axis=(0,2)))[:,np.newaxis,:,:]
+
+
+
+    if scaling_on == True:
+        train_input_sequence_global = scale(train_input_sequence_global, std_train_noise_global, mean_train_noise_global)
+        test_input_sequence = scale(test_input_sequence, std_train_noise_global, mean_train_noise_global)
+
+   
+  
+    #Create a big matrix with multiple train_input_sequences added together 
+    train_input_sequence_big= np.zeros((used_trajectories,2,time_lengh,input_dim_X+group_interaction*2,input_dim_Y+group_interaction*2))
+
+    # Create the train_input_sequence_big 
+    train_input_sequence_big[:,:,:,group_interaction:group_interaction+input_dim_X,group_interaction:group_interaction+input_dim_Y]= train_input_sequence_global[:,:,:,:,:]
+    train_input_sequence_big[:,:,:,0:group_interaction,group_interaction:input_dim_Y+group_interaction]= train_input_sequence_global[:,:,:,input_dim_X-group_interaction:input_dim_X,:]
+    train_input_sequence_big[:,:,:,input_dim_X+group_interaction:input_dim_X+group_interaction*2,group_interaction:input_dim_Y+group_interaction]= train_input_sequence_global[:,:,:,0:group_interaction,:]
+    train_input_sequence_big[:,:,:,group_interaction:group_interaction+input_dim_X,0:group_interaction]= train_input_sequence_global[:,:,:,:,input_dim_Y-group_interaction:input_dim_Y]
+    train_input_sequence_big[:,:,:,0:group_interaction,0:group_interaction]= train_input_sequence_global[:,:,:,input_dim_X-group_interaction:input_dim_X,input_dim_Y-group_interaction:input_dim_Y]
+    train_input_sequence_big[:,:,:,input_dim_X+group_interaction:input_dim_X+group_interaction*2,0:group_interaction]= train_input_sequence_global[:,:,:,0:group_interaction,input_dim_Y-group_interaction:input_dim_Y]
+    train_input_sequence_big[:,:,:,group_interaction:group_interaction+input_dim_X,input_dim_Y+group_interaction:input_dim_Y+group_interaction*2]= train_input_sequence_global[:,:,:,:,0:group_interaction]
+    train_input_sequence_big[:,:,:,0:group_interaction,input_dim_Y+group_interaction:input_dim_Y+group_interaction*2]= train_input_sequence_global[:,:,:,input_dim_X-group_interaction:input_dim_X,0:group_interaction]
+    train_input_sequence_big[:,:,:,input_dim_X+group_interaction:input_dim_X+group_interaction*2,input_dim_Y+group_interaction:input_dim_Y+group_interaction*2]= train_input_sequence_global[:,:,:,0:group_interaction,0:group_interaction]
+    
+    del train_input_sequence_global
+            
+
+    W_out_list= callculate_wout(ridge_param)   
+
+    '''
+    #Store the List W_out_list in a pickle file in the folder Sample_W_out
+    with open('Sample_W_out/NEW_3.pkl', 'wb') as f:
+            pickle.dump(W_out_list, f)
+    
+    #Open the pickle file and load the W_out_list
+    with open('Sample_W_out/NEW_3.pkl', 'rb') as f:
+            W_out_list = pickle.load(f)
+    '''
+
+
+    #Define local variables for one optimization run
+    set_name= "Noise{}, Ridge.para{}, past_states{}, Groupsize{}, Interaction{}, Pred_lengh{}, scaling{}, usedTrajectories{}, onGroupnumbers{}, ausgewaehlte Groupnumbers".format(noise_level, ridge_param, past_states, groupsize, group_interaction, pred_lengh_iterativ, scaling_on, used_trajectories, on_groupnumbers)
+
+    test_input_sequence = test_input_sequence[:,0:pred_lengh_iterativ+past_states,:,:]
+
+    #Tes_input_sequence into two demensional shape alternative implementaion 
+    test_input_sequence_reshap_1=np.reshape(test_input_sequence,(States,pred_lengh_iterativ+past_states,input_dim_X*input_dim_Y))
+    test_input_sequence_reshap= test_input_sequence_reshap_1.transpose((0,2,1)).reshape((input_dim_X*input_dim_Y*States,pred_lengh_iterativ+past_states))
+
+
+    #Prediction Iteration with for Loops
+    prediction= np.zeros((input_dim_total,pred_lengh_iterativ+past_states))
+    for h in range(past_states):
+        prediction[:,h]= test_input_sequence_reshap[:,h]
+
+    for e in range(pred_lengh_iterativ):
+        global last_pred
+        last_pred=prediction[:,e:e+past_states]
+        prediction[:,past_states+e]= prediction_1Iteration()
+
+    #Alternative Implementierung Prediction into original shape 
+    pred_reshape_1= np.reshape(prediction,(States,input_dim_X*input_dim_Y,pred_lengh_iterativ+past_states))
+    pred_reshape= pred_reshape_1.transpose((0,2,1)).reshape((States,pred_lengh_iterativ+past_states,input_dim_X,input_dim_Y))
+
+
+    #Test Input Sequence into original shape
+    test_input_sequence= test_input_sequence_global
+
+    if scaling_on==True:
+        #Descale Prediction and Test Input Sequence
+        pred_reshape= descale(pred_reshape,std_train_noise_global,mean_train_noise_global)
+        test_input_sequence= test_input_sequence_global
+        #train_input_sequence= descale(train_input_sequence_global)
+
+
+    if horizontal_plot==True:
+
+        #Plot the Prediction
+        fig, ax= plt.subplots(3,past_states+pred_lengh_iterativ, figsize=(int((past_states+pred_lengh_iterativ)*int(10/4)),13))
+        for i in range (past_states+pred_lengh_iterativ):
+            ax[0,i].imshow (pred_reshape[0,i,:,:], cmap='Reds')
+            ax[0,i].set_title(f"t={i}")
+            ax[1,i].imshow (test_input_sequence[0,i,:,:], cmap='Reds')
+            ax[2,i].imshow (test_input_sequence[0,i,:,:]-pred_reshape[0,i,:,:], cmap='Reds')
+        
+        ax[0,0].set_ylabel("Pred U")
+        ax[1,0].set_ylabel("True U")
+        ax[2,0].set_ylabel("Error U")
+        fig_path= "Results" + "/{:}.png".format(set_name)
+        plt.savefig(fig_path)
+
+    if horizontal_plot==False:
+
+        #Plot the Prediction
+        fig, ax= plt.subplots(pred_lengh_iterativ,3, figsize=(13,int((pred_lengh_iterativ)*int(10/4))))
+        for i in range (pred_lengh_iterativ):
+            ax[i,0].imshow (pred_reshape[0,i+past_states,:,:], cmap='Reds')
+            ax[i,0].set_ylabel(f"t={i}")
+            ax[i,1].imshow (test_input_sequence[0,i+past_states,:,:], cmap='Reds')
+            ax[i,2].imshow (test_input_sequence[0,i+past_states,:,:]-pred_reshape[0,i+past_states,:,:], cmap='Reds')
+        
+        ax[0,0].set_title("Pred U")
+        ax[0,1].set_title("True U")
+        ax[0,2].set_title("Error U")
+        fig_path= "Results" + "/{:}.png".format(set_name)
+        plt.savefig(fig_path)
+
+
+
+    #Performance Evaluation
+    output= pred_reshape[:,past_states:pred_lengh_iterativ+past_states+1,:,:]
+    target= test_input_sequence[:,past_states:pred_lengh_iterativ+past_states,:,:]
+
+    if performance_eval== 'Standart':
+        serror = np.square(target-output)
+        data_std= np.squeeze(std_train_noise_global)
+
+        nserror = np.zeros((2,pred_lengh_iterativ,input_dim_X,input_dim_Y))
+        for i in range (2):
+            for j in range (pred_lengh_iterativ):
+                for q in range (input_dim_X):
+                    for l in range (input_dim_Y):
+                        nserror[i,j,past_states,l]=serror[i,j,q,l]/(data_std[i,past_states,l]**2)
+
+        mnse = np.mean(nserror, axis=(0,2,3))
+        rmnse = np.sqrt(mnse)
+        tresh = 0.5
+        nerror_bool = rmnse < tresh
+        n_max = np.shape(rmnse)[0]
+        n = 0
+        while nerror_bool[n] == True:
+            n += 1
+            if n == n_max: break
+
+    if performance_eval== 'kinetik':
+
+        #Performance Evaluation by comparing the Kinetik Engergy 
+        #callculate the Kinetic Energy of the Prediction
+        pred_kin_energy= np.zeros((pred_lengh_iterativ))
+        for i in range (pred_lengh_iterativ):
+            pred_kin_energy[i]= 1/((2*math.pi)*(2*math.pi))*np.sum(0.5*np.square(output[0,i,:,:])+0.5*np.square(output[1,i,:,:]))
+
+        #callculate the Kinetic Energy of the Test Input Sequence
+        test_kin_energy= np.zeros((pred_lengh_iterativ))
+        for i in range (pred_lengh_iterativ):
+            test_kin_energy[i]= 1/((2*math.pi)*(2*math.pi))*np.sum(0.5*np.square(target[0,i,:,:])+0.5*np.square(target[1,i,:,:]))
+
+        #callculate the nerror by comparing the Kinetic Energy of the Prediction and the Test Input Sequence
+        nerror= np.zeros((pred_lengh_iterativ))
+        for i in range (pred_lengh_iterativ):
+            nerror[i]= np.abs(pred_kin_energy[i]-test_kin_energy[i])/test_kin_energy[i]
+        
+        #callculate the nerror_bool by comparing the Kinetic Energy of the Prediction and the Test Input Sequence
+        tresh = 0.5
+        nerror_bool = nerror < tresh
+        n_max = np.shape(nerror)[0]
+        n = 0
+        while nerror_bool[n] == True:
+            n += 1
+            if n == n_max: break
+
+    #Plot the pred_kin_energy and the test_kin_energy
+    fig, ax= plt.subplots(1,1, figsize=(13,10))
+    ax.plot(pred_kin_energy, label="Kinetik Energy of Prediction")
+    ax.plot(test_kin_energy, label="Kinetik Energy of Target Data")
+    ax.set_xlabel("t")
+    ax.set_ylabel("Kinetic Energy")
+    ax.legend()
+    fig_path= "Benchmarking_Kinetic_Energy" + "/{:},{:},K=2_Kinetic_Energy.png".format(groupsize,group_interaction)
+    plt.savefig(fig_path)
+
+    # Save pred_kin_energy and the test_kin_energy in one matrix and save it as a pickle file
+    result_store = np.array([pred_kin_energy, test_kin_energy])
+    result_path= "Benchmarking_Kinetic_Energy" + "/{:},{:},K=2_Kinetic_Energy.pickle".format(groupsize,group_interaction)
+    with open(result_path, 'wb') as f:
+        pickle.dump(result_store, f)
+    
+
+
+    #Return not only n but also the noise level and teh ridge parameter for the optimization
+    result = np.array([n, noise_level, ridge_param])
+    return result
+
+
+    
+if __name__ == "__main__":
+
+    set_start_method('fork')
+    y= np.zeros((number_of_runs,3))
+    for i in range (number_of_runs):
+        y[i,:]=optimization()
+
+    '''
+    #Print Optimization Results     
+    fig, ax = plt.subplots()
+    ax.scatter(y[:,1],y[:,2],s=y[:,0]*5, alpha=0.5, label="y")
+    for i in range (number_of_runs):
+        plt.annotate(y[i,0], (y[i,1], y[i,2]))
+    plt.savefig("Results_Optimazation/run_1.png")
+    plt.close()
+    '''
+
+
+
